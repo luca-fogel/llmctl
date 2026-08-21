@@ -170,10 +170,12 @@ field now gets its own `ps` call, with that field last.
 
 ## See also
 
-[**mac-ai-activity**](https://github.com/foggylulu/mac-ai-activity) — the same
-machine's inference *behaviour* rather than its memory: joules per token,
-per-slot llama.cpp telemetry, die temperatures. `llmctl` answers "what is holding
-my RAM"; that answers "what did that generation cost".
+- [**mac-ai-activity**](https://github.com/foggylulu/mac-ai-activity) — the same
+  machine's inference *behaviour* rather than its memory: joules per token,
+  per-slot llama.cpp telemetry, die temperatures. `llmctl` answers "what is
+  holding my RAM"; that answers "what did that generation cost".
+- [**qwen-control-mac**](https://github.com/foggylulu/qwen-control-mac) — turning
+  a big local model on and off from your phone, from anywhere, over Tailscale.
 
 ## License
 
