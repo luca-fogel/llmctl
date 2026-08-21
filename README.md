@@ -179,4 +179,5 @@ field now gets its own `ps` call, with that field last.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Contributions sign off with the
+[DCO](CONTRIBUTING.md#sign-your-work-dco).
