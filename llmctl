@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""llmctl - see which local LLMs are holding RAM, and free them.
+
+Engines it knows about:
+  lmstudio  LM Studio, also shipped as Bionic (llama.cpp + MLX backends)
+  localai   LocalAI
+  ollama    ollama serve
+
+Usage:
+  llmctl                     status table
+  llmctl status --json       machine-readable (used by the menu bar app)
+  llmctl status --fit 28     also answer "would a 28 GB model fit right now?"
+  llmctl free                unload everything
+  llmctl free lmstudio       unload one engine
+  llmctl reclaim             unload idle models
+  llmctl reclaim --servers   also stop IDLE inference servers (releases mlock'd
+                             weights; next use pays a cold load)
+  llmctl reclaim --purge     also flush the page cache (needs your password)
+  llmctl reclaim --dry-run   show the plan, change nothing
+
+`free` unloads models. `reclaim` goes further, because an engine can report
+"nothing loaded" while its server process still pins the weights with mlock --
+which is where the memory actually hides (18.5 GB of it, on the machine that
+prompted this). A server that is mid-generation is never stopped: llama.cpp is
+checked via /slots using the key from its own argv, mlx-lm via its log mtime.
+Large non-AI processes you own are listed but never touched.
+
+Not possible on macOS at any privilege level: releasing compressed or swapped
+memory directly (no API -- the kernel reclaims on demand), per-process swap
+attribution, and per-process memory limits (no cgroups equivalent).
+
+Configuration, all optional:
+  LLMCTL_LMS          path to LM Studio's `lms` CLI   (default ~/.lmstudio/bin/lms)
+  LLMCTL_OLLAMA       path to the `ollama` binary     (default: found on PATH)
+  LLMCTL_LMSTUDIO_URL LM Studio HTTP server           (default http://127.0.0.1:1234)
+  LLMCTL_LOCALAI_URL  LocalAI HTTP server             (default http://127.0.0.1:8080)
+  LLMCTL_MLX_LOG      mlx-lm server log               (default ~/.local/state/mlx-lm/server.log)
+  LOCALAI_API_KEY     LocalAI bearer token; also read from
+                      ~/.config/llmctl/config.env as LOCALAI_API_KEY=...
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = "1.0.0"
+
+GB = 1024 ** 3
+
+LMS = os.environ.get("LLMCTL_LMS", os.path.expanduser("~/.lmstudio/bin/lms"))
+LMSTUDIO_URL = os.environ.get("LLMCTL_LMSTUDIO_URL", "http://127.0.0.1:1234").rstrip("/")
+LOCALAI_URL = os.environ.get("LLMCTL_LOCALAI_URL", "http://127.0.0.1:8080").rstrip("/")
+MLX_LOG = os.path.expanduser(
+    os.environ.get("LLMCTL_MLX_LOG", "~/.local/state/mlx-lm/server.log"))
+CONFIG = os.path.expanduser("~/.config/llmctl/config.env")
+
+
+def ollama_bin():
+    """The ollama binary, or None. Homebrew's opt path is checked explicitly
+    because `ollama` is often not on a GUI app's inherited PATH."""
+    explicit = os.environ.get("LLMCTL_OLLAMA")
+    if explicit:
+        return explicit if os.path.exists(explicit) else None
+    found = shutil.which("ollama")
+    if found:
+        return found
+    for p in ("/opt/homebrew/opt/ollama/bin/ollama", "/opt/homebrew/bin/ollama",
+              "/usr/local/bin/ollama"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+OLLAMA = ollama_bin()
+
+
+def sh(cmd, timeout=25):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return 1, "", str(e)
+
+
+def http(url, data=None, headers=None, timeout=10):
+    req = urllib.request.Request(url, data=data, headers=headers or {},
+                                 method="POST" if data is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception:
+        return None, b""
+
+
+# ---------------------------------------------------------------- system RAM
+
+def parse_vm_stat(text, total):
+    """(used, wired) in bytes from `vm_stat` output, matching Activity Monitor.
+
+    Activity Monitor's "Memory Used" is app memory + wired + compressed.
+    Everything else (free, inactive, file-backed cache) is reclaimable, so a
+    new model can claim it -- which is why a 34 GB GGUF sitting in the page
+    cache must NOT be counted as used. Getting this wrong makes every loaded
+    model look like memory pressure.
+    """
+    m = re.search(r"page size of (\d+)", text)
+    page = int(m.group(1)) if m else 16384
+    stats = {}
+    for line in text.splitlines():
+        mm = re.match(r'"?([A-Za-z][^:"]*)"?:\s+(\d+)', line.strip())
+        if mm:
+            stats[mm.group(1).strip()] = int(mm.group(2)) * page
+    # Saturating subtract: purgeable can exceed anonymous on a busy machine.
+    app = max(0, stats.get("Anonymous pages", 0) - stats.get("Pages purgeable", 0))
+    wired = stats.get("Pages wired down", 0)
+    used = app + wired + stats.get("Pages occupied by compressor", 0)
+    used = max(0, min(used, total))
+    return used, wired
+
+
+def sysmem():
+    """Return (total, available, wired) in bytes."""
+    _, out, _ = sh(["sysctl", "-n", "hw.memsize"])
+    total = int(out.strip() or 0)
+    _, vm, _ = sh(["vm_stat"])
+    used, wired = parse_vm_stat(vm, total)
+    return total, total - used, wired
+
+
+def parse_ps_rss(text, patterns):
+    """Total RSS in bytes over `ps -Ao rss=,args=` lines matching any pattern."""
+    tot, hits = 0, []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rss, _, args = line.partition(" ")
+        if not rss.isdigit():
+            continue
+        for pat in patterns:
+            if pat in args:
+                tot += int(rss) * 1024
+                hits.append(args[:80])
+                break
+    return tot, hits
+
+
+def proc_rss(patterns):
+    _, out, _ = sh(["ps", "-Ao", "rss=,args="])
+    return parse_ps_rss(out, patterns)
+
+
+# ------------------------------------------------------------------- engines
+
+def lmstudio_running():
+    """Is LM Studio / Bionic actually up?
+
+    This gate exists because `lms` LAUNCHES THE APP if it is not running. A
+    monitor that starts the thing it is monitoring is a bug: it made the app
+    un-quittable here, respawning within seconds of every quit. So the CLI is
+    only invoked once something is already listening or the app is in the
+    process table.
+    """
+    code, _ = http(LMSTUDIO_URL + "/api/v0/models", timeout=2)
+    if code is not None:
+        return True
+    rss, _ = proc_rss([".lmstudio/extensions", ".lmstudio/.internal",
+                       "LM Studio.app", "Bionic.app"])
+    return rss > 0
+
+
+def lmstudio():
+    models = []
+    running = lmstudio_running()
+    if running and os.path.exists(LMS):
+        rc, out, _ = sh([LMS, "ps", "--json"])
+        if rc == 0 and out.strip():
+            try:
+                for m in json.loads(out):
+                    ident = m.get("identifier") or m.get("modelKey") or "?"
+                    size = m.get("sizeBytes") or m.get("size") or 0
+                    models.append({"name": ident, "bytes": size,
+                                   "ctx": m.get("contextLength")})
+            except (ValueError, TypeError):
+                pass
+    # The HTTP server also reports extension-pack models (voice, embeddings)
+    # that `lms ps` omits. Only reachable when the server is running.
+    code, body = http(LMSTUDIO_URL + "/api/v0/models", timeout=3)
+    if code == 200:
+        try:
+            known = {m["name"] for m in models}
+            for m in json.loads(body).get("data", []):
+                if m.get("state") == "loaded" and m["id"] not in known:
+                    models.append({"name": m["id"], "bytes": 0, "ctx": None})
+        except (ValueError, KeyError, TypeError):
+            pass
+    # GGUF/MLX models run in a backend process; extension-pack models (voice,
+    # embeddings) are hosted inside the LM Studio utility worker instead.
+    rss, _ = proc_rss([".lmstudio/extensions", ".lmstudio/.internal/utils/node"])
+    return {"engine": "lmstudio", "label": "LM Studio", "models": models,
+            "rss": rss, "running": running or bool(models) or rss > 0}
+
+
+def localai_key():
+    env = os.environ.get("LOCALAI_API_KEY")
+    if env:
+        return env
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                if line.startswith("LOCALAI_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def localai():
+    rss, _ = proc_rss(["local-ai run"])
+    models = []
+    # LocalAI has no "what is resident" endpoint, so residency is inferred from
+    # RSS: the process idles near 80 MB and jumps to tens of GB once weights are
+    # mapped.
+    if rss > 2 * GB:
+        key = localai_key()
+        headers = {"Authorization": "Bearer " + key} if key else None
+        code, body = http(LOCALAI_URL + "/v1/models", headers=headers, timeout=3)
+        names = []
+        if code == 200:
+            try:
+                names = [m["id"] for m in json.loads(body).get("data", [])]
+            except (ValueError, KeyError, TypeError):
+                pass
+        models = [{"name": n, "bytes": 0, "ctx": None} for n in names] or \
+                 [{"name": "(model resident)", "bytes": rss, "ctx": None}]
+    return {"engine": "localai", "label": "LocalAI", "models": models,
+            "rss": rss, "running": rss > 0}
+
+
+def parse_ollama_ps(text):
+    """Models from `ollama ps` output. The size column is human-readable, so it
+    is parsed back to bytes rather than trusted as a number."""
+    models = []
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 4:
+            size = 0
+            m = re.search(r"([\d.]+)\s*(GB|MB)", line)
+            if m:
+                size = int(float(m.group(1)) * (GB if m.group(2) == "GB" else GB / 1024))
+            models.append({"name": parts[0], "bytes": size, "ctx": None})
+    return models
+
+
+def ollama():
+    models = []
+    if OLLAMA:
+        rc, out, _ = sh([OLLAMA, "ps"])
+        if rc == 0:
+            models = parse_ollama_ps(out)
+    rss, _ = proc_rss(["ollama runner", "ollama_llama_server"])
+    srv, _ = proc_rss(["ollama serve"])
+    return {"engine": "ollama", "label": "Ollama", "models": models,
+            "rss": rss, "running": bool(models) or srv > 0}
+
+
+def snapshot():
+    total, avail, wired = sysmem()
+    engines = [lmstudio(), localai(), ollama()]
+    return {"total": total, "available": avail, "wired": wired, "engines": engines,
+            "loaded": sum(len(e["models"]) for e in engines)}
+
+
+# --------------------------------------------------------------------- free
+
+def free(target="all"):
+    """Unload, then verify. Engines can report success and stay resident, so the
+    only trustworthy report is the memory actually returned."""
+    before = snapshot()
+    before_names = {(e["engine"], m["name"]) for e in before["engines"] for m in e["models"]}
+    did = []
+
+    if target in ("all", "lmstudio"):
+        if not os.path.exists(LMS):
+            did.append(("LM Studio", "lms CLI not found"))
+        elif not lmstudio_running():
+            did.append(("LM Studio", "not running"))
+        else:
+            rc, out, err = sh([LMS, "unload", "--all"], timeout=90)
+            did.append(("LM Studio", "unload sent" if rc == 0 else (err.strip() or "failed")))
+
+    if target in ("all", "localai"):
+        eng = localai()
+        if not eng["models"]:
+            did.append(("LocalAI", "nothing loaded"))
+        else:
+            key = localai_key()
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = "Bearer " + key
+            results = []
+            for m in eng["models"]:
+                c, _ = http(LOCALAI_URL + "/backend/shutdown",
+                            data=json.dumps({"model": m["name"]}).encode(),
+                            headers=headers, timeout=60)
+                results.append(m["name"] if c == 200 else "%s (HTTP %s)" % (m["name"], c))
+            did.append(("LocalAI", ", ".join(results)))
+
+    if target in ("all", "ollama"):
+        if not OLLAMA:
+            did.append(("Ollama", "not installed"))
+        else:
+            rc, out, _ = sh([OLLAMA, "ps"])
+            names = [l.split()[0] for l in out.splitlines()[1:] if l.split()]
+            for n in names:
+                sh([OLLAMA, "stop", n], timeout=30)
+            did.append(("Ollama", ", ".join(names) if names else "nothing loaded"))
+
+    time.sleep(2.5)
+    after = snapshot()
+    freed = after["available"] - before["available"]
+    stuck = [(e["label"], m["name"]) for e in after["engines"] for m in e["models"]
+             if (e["engine"], m["name"]) in before_names]
+    return did, freed, stuck
+
+
+# ------------------------------------------------------------------ reclaim
+
+def _argv_of(pid):
+    rc, out, _ = sh(["ps", "-o", "args=", "-p", str(pid)])
+    return out.strip().split() if rc == 0 else []
+
+
+def classify_server(comm, args):
+    """Which kind of inference server a process is, or None.
+
+    Matching on both `comm` and the full argv matters: llama.cpp servers are
+    frequently launched from a bundled path where comm is truncated, and
+    mlx-lm appears only as a module name inside a python argv.
+    """
+    if "llama-server" in comm or "llama-server" in args:
+        return "llama.cpp"
+    if "mlx_lm.server" in args or "mlx_vlm.server" in args:
+        return "mlx-lm"
+    if comm.endswith("local-ai"):
+        return "LocalAI"
+    return None
+
+
+def parse_pid_map(text):
+    """pid -> rest-of-line, from `ps -Ao pid=,<one field>=` output.
+
+    The field has to be LAST in the ps format string. Given anything after it,
+    ps truncates it to a fixed column width without warning: `comm` for
+    mediaanalysisd came back as the literal string "/System/Library/", whose
+    basename is empty, which is how a process with no name appeared in the
+    output of an earlier version of this tool.
+    """
+    out = {}
+    for line in text.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        if pid.isdigit() and rest.strip():
+            out[int(pid)] = rest.strip()
+    return out
+
+
+def parse_pid_numbers(text):
+    """pid -> (uid, rss_bytes) from `ps -Ao pid=,uid=,rss=`. All numeric, so
+    column truncation cannot bite."""
+    out = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+            out[int(parts[0])] = (parts[1], int(parts[2]) * 1024)
+    return out
+
+
+def ps_table():
+    """One row per process: pid, uid, rss, comm, args.
+
+    Three ps calls rather than one, so that `comm` and `args` are each the last
+    column of their own call and neither gets truncated.
+    """
+    _, nums, _ = sh(["ps", "-Ao", "pid=,uid=,rss="])
+    _, comms, _ = sh(["ps", "-Ao", "pid=,comm="])
+    _, argvs, _ = sh(["ps", "-Ao", "pid=,args="])
+    numbers = parse_pid_numbers(nums)
+    comm_by_pid = parse_pid_map(comms)
+    args_by_pid = parse_pid_map(argvs)
+    rows = []
+    for pid, (uid, rss) in numbers.items():
+        rows.append({"pid": pid, "uid": uid, "rss": rss,
+                     "comm": comm_by_pid.get(pid, ""),
+                     "args": args_by_pid.get(pid, "")})
+    return rows
+
+
+def servers_from_table(rows):
+    """Inference servers among ps_table() rows."""
+    out = []
+    for r in rows:
+        kind = classify_server(r["comm"], r["args"])
+        if kind:
+            out.append({"pid": r["pid"], "kind": kind, "rss": r["rss"],
+                        "args": r["args"]})
+    return out
+
+
+def inference_servers():
+    """Running inference server processes, with whether each is busy.
+
+    Kept separate from engines: an engine can report 'no models loaded' while
+    its server process still pins the weights with mlock. That gap is exactly
+    where the memory hides -- 18.5 GB of it, in the case that prompted this.
+    """
+    servers = servers_from_table(ps_table())
+    for s in servers:
+        s["busy"] = _server_busy(s["kind"], s["pid"])
+    return servers
+
+
+def port_and_key(argv):
+    """--port and --api-key out of a llama-server argv. Both are ephemeral and
+    appear in no config file, so argv is the only source of truth."""
+    port = key = None
+    for i, a in enumerate(argv):
+        if a == "--port" and i + 1 < len(argv):
+            port = argv[i + 1]
+        if a in ("--api-key", "--api_key") and i + 1 < len(argv):
+            key = argv[i + 1]
+    return port, key
+
+
+def _server_busy(kind, pid):
+    """Best-effort: never stop something that is mid-generation.
+
+    Returns True (busy), False (idle) or None (cannot tell) -- and None is not
+    False. A server whose state is unknown is reported as unknown.
+    """
+    if kind == "llama.cpp":
+        port, key = port_and_key(_argv_of(pid))
+        if not port:
+            return None
+        h = {"Authorization": "Bearer " + key} if key else None
+        c, body = http("http://127.0.0.1:%s/slots" % port, headers=h, timeout=5)
+        if c != 200:
+            return None
+        try:
+            return any(s.get("is_processing") for s in json.loads(body))
+        except Exception:
+            return None
+    if kind == "mlx-lm":
+        try:
+            if time.time() - os.path.getmtime(MLX_LOG) < 3:
+                return True
+        except OSError:
+            return None
+        return False
+    return None
+
+
+AI_HINTS = ("llama", "mlx_lm", "mlx_vlm", "local-ai", "ollama", "lmstudio",
+            "LM Studio", "Bionic", "AIActivity", "/lms")
+
+
+def display_name(comm, args):
+    """A name a human can act on.
+
+    `comm` is preferred because it survives paths with spaces, but a comm ending
+    in "/" is a truncated directory rather than a program -- ps does that -- so
+    fall back to the first token of argv.
+    """
+    if comm and not comm.endswith("/"):
+        base = os.path.basename(comm)
+        if base:
+            return base
+    first = args.split()[0] if args else ""
+    return os.path.basename(first) or os.path.basename(comm.rstrip("/")) or "?"
+
+
+def hogs_from_table(rows, uid, limit=6, floor=512 * 1024 * 1024):
+    """Large processes owned by `uid` that are NOT local-AI, so they can be
+    judged by a human. Never acted on."""
+    out = []
+    for r in rows:
+        if r["uid"] != uid or r["rss"] < floor:
+            continue
+        if any(h in r["args"] or h in r["comm"] for h in AI_HINTS):
+            continue
+        out.append((r["rss"], r["pid"], display_name(r["comm"], r["args"])))
+    out.sort(reverse=True)
+    return out[:limit]
+
+
+def memory_hogs(limit=6, floor=512 * 1024 * 1024):
+    return hogs_from_table(ps_table(), str(os.getuid()), limit, floor)
+
+
+def reclaim(stop_servers=False, do_purge=False, dry_run=False):
+    before = snapshot()
+    plan, done = [], []
+
+    idle_models = []
+    for e in before["engines"]:
+        for m in e["models"]:
+            idle_models.append((e["engine"], e["label"], m["name"], m.get("bytes") or 0))
+    for _, label, name, b in idle_models:
+        plan.append(("unload", "%s: %s" % (label, name), b))
+
+    servers = inference_servers()
+    if stop_servers:
+        for s in servers:
+            if s["busy"]:
+                plan.append(("skip", "%s pid %d is GENERATING" % (s["kind"], s["pid"]), 0))
+            else:
+                plan.append(("stop", "%s pid %d" % (s["kind"], s["pid"]), s["rss"]))
+    if do_purge:
+        plan.append(("purge", "flush page cache (needs your password)", 0))
+
+    if dry_run:
+        return plan, [], 0, servers
+
+    if idle_models:
+        d, _, _ = free("all")
+        done.extend(d)
+
+    if stop_servers:
+        for s in servers:
+            if s["busy"]:
+                done.append((s["kind"], "SKIPPED - generating"))
+                continue
+            rc, _, err = sh(["kill", str(s["pid"])], timeout=10)
+            done.append((s["kind"], "stopped pid %d" % s["pid"] if rc == 0
+                         else "failed: %s" % err.strip()))
+
+    if do_purge:
+        rc, _, err = sh(["sudo", "purge"], timeout=120)
+        done.append(("purge", "done" if rc == 0 else "failed: %s" % (err.strip() or "cancelled")))
+
+    time.sleep(2.5)
+    after = snapshot()
+    return plan, done, after["available"] - before["available"], servers
+
+
+# ------------------------------------------------------------------- display
+
+def human(b):
+    return "-" if not b else ("%.1f GB" % (b / GB) if b >= GB else "%.0f MB" % (b / 1024 / 1024))
+
+
+def status(fit_gb=()):
+    s = snapshot()
+    total, avail = s["total"], s["available"]
+    used = total - avail
+    width = 34
+    filled = int(round(width * used / total)) if total else 0
+    bar = "█" * filled + "░" * (width - filled)
+    print()
+    print("  MEMORY  [%s]  %.1f / %.0f GB used" % (bar, used / GB, total / GB))
+    print("          %.1f GB available for a model  (%.1f GB wired)"
+          % (avail / GB, s["wired"] / GB))
+    print()
+    any_loaded = False
+    for e in s["engines"]:
+        if not e["running"] and not e["models"]:
+            print("  ○ %-20s idle" % e["label"])
+            continue
+        held = e["rss"]
+        mark = "●" if e["models"] else "○"
+        print("  %s %-20s %s held" % (mark, e["label"], human(held) if held else "0 MB"))
+        for m in e["models"]:
+            any_loaded = True
+            ctx = "  ctx %s" % m["ctx"] if m.get("ctx") else ""
+            print("      └ %s%s" % (m["name"], ctx))
+    print()
+    # Headroom needs a couple of GB for the KV cache and the OS, so a model is
+    # only reported as fitting with that margin left over.
+    for gb_wanted in fit_gb:
+        verdict = "fits" if avail / GB >= gb_wanted + 2 else "WILL FAIL - free memory first"
+        print("  a %g GB model: %s" % (gb_wanted, verdict))
+    if fit_gb:
+        print()
+    if any_loaded:
+        print("  free it:  llmctl free\n")
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "status"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+    elif cmd in ("-V", "--version", "version"):
+        print("llmctl %s" % VERSION)
+    elif cmd == "free":
+        target = args[1] if len(args) > 1 and not args[1].startswith("-") else "all"
+        if target not in ("all", "lmstudio", "localai", "ollama"):
+            sys.exit("unknown engine: %s" % target)
+        did, freed, stuck = free(target)
+        print()
+        for name, res in did:
+            print("  %-12s %s" % (name, res))
+        print("\n  freed %.1f GB" % max(0.0, freed / GB))
+        for label, name in stuck:
+            print("  still resident: %s (%s)" % (name, label))
+            print("     -> pinned by the app itself; quit it to release the memory")
+        status()
+    elif cmd == "reclaim":
+        dry = "--dry-run" in args or "-n" in args
+        plan, done, freed, servers = reclaim(
+            stop_servers="--servers" in args, do_purge="--purge" in args, dry_run=dry)
+        print()
+        if dry:
+            print("  would do:")
+            for kind, what, b in plan:
+                print("    %-7s %-52s %s" % (kind, what, human(b) if b else ""))
+            if not plan:
+                print("    nothing to reclaim")
+        else:
+            for name, res in done:
+                print("  %-12s %s" % (name, res))
+            print("\n  freed %.1f GB" % max(0.0, freed / GB))
+        # Re-query: `servers` was captured BEFORE stopping anything.
+        srv = inference_servers() if not dry else servers
+        if srv:
+            print("\n  inference servers still running:")
+            for x in srv:
+                state = "GENERATING" if x["busy"] else ("idle" if x["busy"] is False else "unknown")
+                print("    %-10s pid %-7d %-9s %s" % (x["kind"], x["pid"], human(x["rss"]), state))
+            if "--servers" not in args:
+                print("     -> these pin memory with mlock; "
+                      "`llmctl reclaim --servers` stops idle ones")
+        hogs = memory_hogs()
+        if hogs:
+            print("\n  largest non-AI processes you own:")
+            for rss, pid, name in hogs:
+                print("    %-28s pid %-7d %s" % (name[:28], pid, human(rss)))
+            print("     -> quit these yourself; llmctl will not touch them")
+        if not dry:
+            status()
+    elif cmd == "status":
+        if "--json" in args:
+            print(json.dumps(snapshot()))
+        else:
+            fits = []
+            for i, a in enumerate(args):
+                if a == "--fit" and i + 1 < len(args):
+                    try:
+                        fits.append(float(args[i + 1]))
+                    except ValueError:
+                        sys.exit("--fit wants a number of GB")
+            status(fits)
+    else:
+        sys.exit("unknown command: %s (try --help)" % cmd)
+
+
+if __name__ == "__main__":
+    main()

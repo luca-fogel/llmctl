@@ -1,0 +1,8 @@
+build/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Local agent / tooling state
+.claude-flow/
+.claude/
