@@ -174,8 +174,8 @@ field now gets its own `ps` call, with that field last.
   machine's inference *behaviour* rather than its memory: joules per token,
   per-slot llama.cpp telemetry, die temperatures. `llmctl` answers "what is
   holding my RAM"; that answers "what did that generation cost".
-- [**qwen-control-mac**](https://github.com/foggylulu/qwen-control-mac) — turning
-  a big local model on and off from your phone, from anywhere, over Tailscale.
+- [**wake-on-llm**](https://github.com/foggylulu/wake-on-llm) — turning a big
+  local model on and off from your phone, from anywhere, over Tailscale.
 
 ## License
 
