@@ -177,6 +177,10 @@ field now gets its own `ps` call, with that field last.
 - [**wake-on-llm**](https://github.com/foggylulu/wake-on-llm) — turning a big
   local model on and off from your phone, from anywhere, over Tailscale.
 
+- [**solvr-ai**](https://github.com/foggylulu/solvr-ai) — a maths tutor app for
+  iOS and macOS that runs against a hosted API, a local server, or Apple's
+  on-device model, and measures the difference.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Contributions sign off with the
