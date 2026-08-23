@@ -176,7 +176,6 @@ field now gets its own `ps` call, with that field last.
   holding my RAM"; that answers "what did that generation cost".
 - [**wake-on-llm**](https://github.com/foggylulu/wake-on-llm) — turning a big
   local model on and off from your phone, from anywhere, over Tailscale.
-
 - [**solvr-ai**](https://github.com/foggylulu/solvr-ai) — a maths tutor app for
   iOS and macOS that runs entirely on Apple's on-device model: no API key, no
   server, no network.
