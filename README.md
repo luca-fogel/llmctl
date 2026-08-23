@@ -178,8 +178,8 @@ field now gets its own `ps` call, with that field last.
   local model on and off from your phone, from anywhere, over Tailscale.
 
 - [**solvr-ai**](https://github.com/foggylulu/solvr-ai) — a maths tutor app for
-  iOS and macOS that runs against a hosted API, a local server, or Apple's
-  on-device model, and measures the difference.
+  iOS and macOS that runs entirely on Apple's on-device model: no API key, no
+  server, no network.
 
 ## License
 
