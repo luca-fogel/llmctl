@@ -32,7 +32,7 @@ Because the number you need is not the number it shows.
 ## Install
 
 ```sh
-git clone https://github.com/foggylulu/llmctl.git
+git clone https://github.com/luca-fogel/llmctl.git
 cd llmctl
 ./install.sh              # symlinks the CLI onto your PATH, builds the menu bar app
 ./install.sh --cli-only   # just the CLI
@@ -170,13 +170,13 @@ field now gets its own `ps` call, with that field last.
 
 ## See also
 
-- [**mac-ai-activity**](https://github.com/foggylulu/mac-ai-activity) — the same
+- [**mac-ai-activity**](https://github.com/luca-fogel/mac-ai-activity) — the same
   machine's inference *behaviour* rather than its memory: joules per token,
   per-slot llama.cpp telemetry, die temperatures. `llmctl` answers "what is
   holding my RAM"; that answers "what did that generation cost".
-- [**wake-on-llm**](https://github.com/foggylulu/wake-on-llm) — turning a big
+- [**wake-on-llm**](https://github.com/luca-fogel/wake-on-llm) — turning a big
   local model on and off from your phone, from anywhere, over Tailscale.
-- [**solvr-ai**](https://github.com/foggylulu/solvr-ai) — a maths tutor app for
+- [**solvr-ai**](https://github.com/luca-fogel/solvr-ai) — a maths tutor app for
   iOS and macOS that runs entirely on Apple's on-device model: no API key, no
   server, no network.
 
